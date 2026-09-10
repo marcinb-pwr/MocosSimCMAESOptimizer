@@ -1957,6 +1957,10 @@ function load_config(path::String)
     raw["output_dir"] = isabspath(output_value) ? output_value :
         normpath(joinpath(config_dir, output_value))
     stages = [StageConfig(s["name"], s["fit_months"], s["max_iterations"], s["population_size"], float(s["sigma"])) for s in raw["stages"]]
+    for stage in stages
+        isfinite(stage.sigma) && CMA_SIGMA_MIN <= stage.sigma <= CMA_SIGMA_MAX ||
+            throw(ArgumentError("stage $(stage.name) sigma $(stage.sigma) is outside the optimizer-supported range [$(CMA_SIGMA_MIN), $(CMA_SIGMA_MAX)]"))
+    end
     scalar_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["scalar_bounds"])
     temporal_bounds = Dict(k => (float(v[1]), float(v[2])) for (k, v) in raw["temporal_bounds"])
     scalar_preprocessing = Dict{String,Dict{String,Any}}()
@@ -4250,6 +4254,8 @@ function append_cma_candidate_record(
         "simulation_distribution" => Dict(
             "mean" => state.mean,
             "sigma" => state.sigma,
+            "configured_initial_sigma" => stage.sigma,
+            "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
             "covariance" => state.covariance,
         ),
     ))
@@ -4394,6 +4400,8 @@ function run_stage(
         "parameter_names" => coordinate_names(specs_stage),
         "population_size" => stage.population_size,
         "max_iterations" => stage.max_iterations,
+        "configured_initial_sigma" => stage.sigma,
+        "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
         "early_stop" => Dict(
             "min_completion_fraction" => cfg.objective.min_completion_fraction,
             "finish_iter_delay" => cfg.objective.finish_iter_delay,
@@ -4432,7 +4440,7 @@ function run_stage(
         state = CMAState(copy(best_vector), sigma_resume, state.covariance, p_c, p_sigma)
     end
     start_iter = max(1, resume_from + 1)
-    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size use_slurm=use_slurm search_policy=policy.name
+    @info "Starting stage run" stage=stage.name fit_months=active_months start_iter=start_iter max_iterations=stage.max_iterations population_size=stage.population_size configured_initial_sigma=stage.sigma sigma_min=CMA_SIGMA_MIN sigma_max=CMA_SIGMA_MAX resumed=(resume_state !== nothing) use_slurm=use_slurm search_policy=policy.name
 
     for iter in start_iter:stage.max_iterations
         @info "Starting iteration" stage=stage.name iteration=iter sigma=state.sigma best_score=best_score
@@ -4481,6 +4489,8 @@ function run_stage(
             "param_names" => coordinate_names(specs_stage),
             "mean" => state.mean,
             "sigma" => state.sigma,
+            "configured_initial_sigma" => stage.sigma,
+            "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
             "covariance" => state.covariance,
             "p_c" => state.p_c,
             "p_sigma" => state.p_sigma,
@@ -4939,6 +4949,8 @@ function run_stage(
             "fit_months" => active_months,
             "best_score" => best_score,
             "sigma" => state.sigma,
+            "configured_initial_sigma" => stage.sigma,
+            "sigma_limits" => Dict("min" => CMA_SIGMA_MIN, "max" => CMA_SIGMA_MAX),
             "covariance_trace" => tr(state.covariance),
             "covariance" => state.covariance,
             "p_c" => state.p_c,

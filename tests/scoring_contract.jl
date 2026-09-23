@@ -228,6 +228,52 @@ end
     end
 end
 
+@testset "final-sum error and trajectory shape remain independent" begin
+    @test O.final_sum_relative_error([1.0, 2.0], [1.0, 2.0]) == 0.0
+    @test O.final_sum_relative_error([2.0, 2.0], [1.0, 1.0]) == 0.5
+    @test O.final_sum_relative_error([2.0, 2.0], [3.0, 3.0]) == 0.5
+    @test O.final_sum_relative_error([0.0, 0.0], [1.0, 2.0]) == 3.0
+
+    mktempdir() do root
+        daily = joinpath(root, "daily.h5")
+        h5open(daily, "w") do h5
+            grp = create_group(h5, "trajectory_1")
+            # Same endpoint total as GT, but clearly shifted in time.
+            write(grp, "daily_detections", [0.0, 0.0, 4.0])
+        end
+        gt = Union{Missing,Float64}[4.0, 0.0, 0.0]
+        @test O.per_trajectory_final_sum_relative_error(
+            daily, "daily_detections", gt, 3) == 0.0
+        @test only(O.cumulative_error_distribution(
+            daily, "daily_detections", gt, 3)) > 0.0
+    end
+end
+
+@testset "final-sum penalty records threshold and weighted contribution" begin
+    objective = O.ObjectiveConfig(Dict{String,Float64}(), 1, 1.0, 1,
+        "baseline", 0.0, 0.0,
+        Dict("daily_detections" => 2.0, "daily_deaths" => 3.0),
+        0.1, 4.0, 2.0)
+    cfg = selection_test_config(Dict{String,Any}())
+    cfg = O.OptimizerConfig(cfg.seed_config, cfg.output_dir, cfg.monthly_days,
+        cfg.stages, cfg.scalar_bounds, cfg.temporal_bounds,
+        cfg.scalar_preprocessing, cfg.temporal_parameterization,
+        cfg.age_population_weights, cfg.validation, objective, cfg.external_sim,
+        cfg.stage_freeze, cfg.initial_state, cfg.posterior)
+    metrics = Dict{String,Any}(
+        "daily_detections_final_sum_relative_error" => 0.05,
+        "daily_deaths_final_sum_relative_error" => 0.30,
+    )
+    score = O.objective_score(cfg, metrics, 0.0, 0.0, 0.0)
+    # detections: 2*0.05; deaths: 3*(0.30 + 4*0.20^2)
+    @test score ≈ 1.48
+    deaths = metrics["effective_metric_manifest"]["daily_deaths_final_sum_relative_error"]
+    @test deaths["raw_error"] == 0.30
+    @test deaths["threshold"] == 0.1
+    @test deaths["excess"] ≈ 0.2
+    @test deaths["objective_contribution"] ≈ 1.38
+end
+
 @testset "daily scoring returns heterogeneous validation diagnostics" begin
     mktempdir() do root
         gt_dir = joinpath(root, "gt")

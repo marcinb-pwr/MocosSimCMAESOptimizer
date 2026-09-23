@@ -46,6 +46,15 @@
     ]
   },
   "objective": {
+    "final_sum_penalty": {
+      "weights": {
+        "daily_detections": 1.0,
+        "daily_deaths": 1.0
+      },
+      "tolerance": 0.1,
+      "excess_multiplier": 4.0,
+      "excess_power": 2.0
+    },
     "weights": {
       "daily_detections": 1.0,
       "daily_hospitalizations": 0.0,

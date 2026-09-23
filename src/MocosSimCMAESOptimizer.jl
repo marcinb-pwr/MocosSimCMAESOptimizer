@@ -93,7 +93,20 @@ struct ObjectiveConfig
     search_policy::String
     temporal_jump_weight::Float64
     infection_extrema_weight::Float64
+    final_sum_weights::Dict{String,Float64}
+    final_sum_tolerance::Float64
+    final_sum_excess_multiplier::Float64
+    final_sum_excess_power::Float64
 end
+
+# Preserve the public constructor used by older reconstruction fixtures;
+# explicit reconstruction configs opt into the new endpoint constraint.
+ObjectiveConfig(weights, top_k, min_completion_fraction, finish_iter_delay,
+                search_policy, temporal_jump_weight, infection_extrema_weight) =
+    ObjectiveConfig(weights, top_k, min_completion_fraction, finish_iter_delay,
+        search_policy, temporal_jump_weight, infection_extrema_weight,
+        Dict("daily_detections" => 0.0, "daily_deaths" => 0.0),
+        0.10, 4.0, 2.0)
 
 struct PosteriorConfig
     enabled::Bool
@@ -2029,6 +2042,23 @@ function load_config(path::String)
             scalar_preprocessing[String(k)] = Dict(String(kk) => vv for (kk, vv) in v)
         end
     end
+    final_sum_raw = get(raw["objective"], "final_sum_penalty", Dict{String,Any}())
+    final_sum_weights_raw = get(final_sum_raw, "weights", Dict(
+        "daily_detections" => 1.0, "daily_deaths" => 1.0))
+    final_sum_weights = Dict(String(k) => float(v) for (k, v) in final_sum_weights_raw)
+    all(k -> k in ("daily_detections", "daily_deaths"), keys(final_sum_weights)) ||
+        throw(ArgumentError("objective.final_sum_penalty.weights supports only daily_detections and daily_deaths"))
+    any(v -> !isfinite(v) || v < 0.0, values(final_sum_weights)) &&
+        throw(ArgumentError("objective.final_sum_penalty.weights must be nonnegative and finite"))
+    final_sum_tolerance = float(get(final_sum_raw, "tolerance", 0.10))
+    final_sum_multiplier = float(get(final_sum_raw, "excess_multiplier", 4.0))
+    final_sum_power = float(get(final_sum_raw, "excess_power", 2.0))
+    isfinite(final_sum_tolerance) && final_sum_tolerance >= 0.0 ||
+        throw(ArgumentError("objective.final_sum_penalty.tolerance must be nonnegative and finite"))
+    isfinite(final_sum_multiplier) && final_sum_multiplier >= 0.0 ||
+        throw(ArgumentError("objective.final_sum_penalty.excess_multiplier must be nonnegative and finite"))
+    isfinite(final_sum_power) && final_sum_power > 1.0 ||
+        throw(ArgumentError("objective.final_sum_penalty.excess_power must be finite and greater than one"))
     objective = ObjectiveConfig(
         Dict(k => float(v) for (k, v) in raw["objective"]["weights"]),
         Int(get(raw["objective"], "top_k", 1)),
@@ -2037,6 +2067,10 @@ function load_config(path::String)
         String(get(raw["objective"], "search_policy", "baseline")),
         float(get(raw["objective"], "temporal_jump_weight", 0.2)),
         float(get(raw["objective"], "infection_extrema_weight", 0.1)),
+        final_sum_weights,
+        final_sum_tolerance,
+        final_sum_multiplier,
+        final_sum_power,
     )
     posterior_raw = get(raw, "posterior", Dict{String,Any}())
     posterior = PosteriorConfig(
@@ -2845,10 +2879,37 @@ function per_trajectory_cumulative_error(daily_path::String, metric::String, gt_
         isempty(gg) && continue
         gc = cumulative_series(gg)
         sc = cumulative_series(ss)
-        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+        # This term measures the entire cumulative curve, not merely its last
+        # point.  Endpoint agreement therefore cannot hide a time-shifted fit.
+        push!(vals, rmae_series(sc, gc))
     end
     isempty(vals) && return Inf
     return sum(vals) / length(vals)
+end
+
+"""Relative endpoint-total error with a denominator safe for zero GT totals."""
+function final_sum_relative_error(gt::AbstractVector{<:Real}, sim::AbstractVector{<:Real})
+    gt_total = sum(Float64.(gt))
+    sim_total = sum(Float64.(sim))
+    return abs(gt_total - sim_total) / max(abs(gt_total), 1.0)
+end
+
+function per_trajectory_final_sum_relative_error(daily_path::String, metric::String,
+        gt_series::AbstractVector{T} where T<:Union{Missing,Float64}, days::Int)
+    trajs = read_daily_metric(daily_path, metric)
+    trajs === nothing && return Inf
+    errors = Float64[]
+    for traj in trajs
+        g, s, _ = paired_observations(gt_series, traj, days)
+        isempty(g) || push!(errors, final_sum_relative_error(g, s))
+    end
+    return isempty(errors) ? Inf : mean(errors)
+end
+
+function final_sum_penalty(cfg::ObjectiveConfig, raw_error::Real)
+    error = Float64(raw_error)
+    excess = max(error - cfg.final_sum_tolerance, 0.0)
+    return error + cfg.final_sum_excess_multiplier * excess^cfg.final_sum_excess_power
 end
 
 function per_trajectory_blocked_cumulative_error(
@@ -3289,7 +3350,7 @@ function cumulative_error_distribution(daily_path::String, metric::String, gt_se
         isempty(g) && continue
         gc = cumulative_series(g)
         sc = cumulative_series(s)
-        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+        push!(vals, rmae_series(sc, gc))
     end
     return vals
 end
@@ -3302,7 +3363,7 @@ function cumulative_metric_values(daily_path::String, metric::String, gt_series:
         g, s, _ = paired_observations(gt_series, traj, days)
         isempty(g) && continue
         gc, sc = cumulative_series(g), cumulative_series(s)
-        push!(vals, abs(last(sc) - last(gc)) / max(abs(last(gc)), 1.0))
+        push!(vals, rmae_series(sc, gc))
     end
     return vals
 end
@@ -3532,6 +3593,9 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), training_days)
         metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, drop_missing(gtvals), training_days)
         metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, training_days)
+        metric in ("daily_detections", "daily_deaths") &&
+            (metrics["$(metric)_final_sum_relative_error"] =
+                per_trajectory_final_sum_relative_error(daily_path, metric, gtvals, training_days))
     end
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = temporal_jump_penalty(cfg, candidate)
@@ -3566,6 +3630,9 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
         metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, training_days)
         metrics["$(metric)_cumulative"] = per_trajectory_cumulative_error(daily_path, metric, gtvals, training_days)
         metrics["$(metric)_cumulative_blocked"] = per_trajectory_blocked_cumulative_error(daily_path, metric, gtvals, training_days)
+        metric in ("daily_detections", "daily_deaths") &&
+            (metrics["$(metric)_final_sum_relative_error"] =
+                per_trajectory_final_sum_relative_error(daily_path, metric, gtvals, training_days))
     end
     metrics["weekly_control_score"] = weekly_control
     jump_penalty = candidate === nothing ? 0.0 : temporal_jump_penalty(cfg, candidate)
@@ -3650,6 +3717,25 @@ function effective_metric_manifest(
         "finite" => isfinite(extrema_penalty),
         "all_missing_policy" => "Inf",
     )
+    for metric in ("daily_detections", "daily_deaths")
+        name = "$(metric)_final_sum_relative_error"
+        weight = get(cfg.objective.final_sum_weights, metric, 0.0)
+        raw = try Float64(get(metrics, name, Inf)) catch; Inf end
+        excess = isfinite(raw) ? max(raw - cfg.objective.final_sum_tolerance, 0.0) : Inf
+        penalized = isfinite(raw) ? final_sum_penalty(cfg.objective, raw) : Inf
+        manifest[name] = Dict(
+            "enabled" => weight > 0.0,
+            "required" => weight > 0.0,
+            "weight" => weight,
+            "source_present" => haskey(metrics, name),
+            "raw_error" => raw,
+            "threshold" => cfg.objective.final_sum_tolerance,
+            "excess" => excess,
+            "penalized_error" => penalized,
+            "objective_contribution" => weight > 0.0 ? weight * penalized : 0.0,
+            "all_missing_policy" => "Inf",
+        )
+    end
     return manifest
 end
 
@@ -3677,6 +3763,17 @@ function objective_score(
     wc_weight = Float64(get(weights, "weekly_control", 1.0))
     wc_weight > 0.0 && !isfinite(weekly_control) && (invalid = true)
     wc_weight > 0.0 && (total += wc_weight * weekly_control)
+    for metric in ("daily_detections", "daily_deaths")
+        weight = get(cfg.objective.final_sum_weights, metric, 0.0)
+        weight <= 0.0 && continue
+        name = "$(metric)_final_sum_relative_error"
+        value = try Float64(get(metrics, name, Inf)) catch; Inf end
+        if !isfinite(value)
+            invalid = true
+        else
+            total += weight * final_sum_penalty(cfg.objective, value)
+        end
+    end
     for (metric, raw_value) in metrics
         metric in keys(OBJECTIVE_METRIC_DEFAULTS) && continue
         metric in ("weekly_control_score", "temporal_jump_penalty",

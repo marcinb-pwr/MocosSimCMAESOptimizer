@@ -11,6 +11,7 @@ const ROOT = normpath(joinpath(@__DIR__, ".."))
     @test [s["max_iterations"] for s in raw["stages"]] == [10, 15, 20]
     @test raw["validation"]["active_temporal_tail_months"] == 3
     @test raw["validation"]["rank_on_validation"] == true
+    @test raw["validation"]["mode"] == "forecast"
     @test raw["validation"]["plateau_patience"] == 3
     @test raw["validation"]["require_finite_validation_replicates"] == 3
     @test raw["validation"]["selection_replicate_seeds"] == [43, 44]
@@ -29,6 +30,8 @@ end
     @test p1_alt["stages"][1]["sigma"] == 0.2
     @test p1_alt["stages"][1]["fit_months"] == 3
     @test p1_alt["output_dir"] == "./runs/saxony-corrected-phase1-scalars-3m-alt"
+    @test p1_alt["validation"]["mode"] == "reconstruction"
+    @test p1_alt["validation"]["rank_on_validation"] == false
     @test p2["stages"][1]["sigma"] == 0.2
     @test O.CMA_SIGMA_MAX == 0.2
     @test p1["validation"]["selection_objective_weights"] == p2["validation"]["selection_objective_weights"]

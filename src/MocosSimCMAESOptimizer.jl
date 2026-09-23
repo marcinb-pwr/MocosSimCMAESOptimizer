@@ -17,11 +17,29 @@ const CMA_SIGMA_MAX = 0.20
 const NEW_TEMPORAL_VARIANCE = 0.04
 
 include("event_calendar.jl")
+"""Return the globally unique identity of one archive evaluation."""
+archive_entry_id(stage, iteration, candidate) = string(stage, ":", iteration, ":", candidate)
+
+"""Read an archive identity, accepting candidate-only artifacts from older runs."""
+function archive_entry_id(entry::AbstractDict)
+    explicit = get(entry, "archive_entry_id", nothing)
+    explicit === nothing || return string(explicit)
+    return string(get(entry, "candidate", get(entry, "id", "")))
+end
+
+function _set_archive_entry_id!(entry::AbstractDict)
+    if !haskey(entry, "archive_entry_id") &&
+       haskey(entry, "stage") && haskey(entry, "iteration") && haskey(entry, "candidate")
+        entry["archive_entry_id"] = archive_entry_id(
+            entry["stage"], entry["iteration"], entry["candidate"])
+    end
+    return entry
+end
 
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        run_nuts_from_stage, posterior_reusable_state, safe_save_json,
        survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
-       persist_archive_transfer_manifest, preflight_config, create_candidate_root,
+       persist_archive_transfer_manifest, archive_entry_id, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
        preserve_incumbent!,
@@ -782,7 +800,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
         expected_fit_months=predecessor.fit_months,
         expected_manifest_path=joinpath(root, "archive_transfer_manifest.json"),
         stage_order=[s.name for s in cfg.stages])
-    archive_ids = [String(get(x, "candidate", get(x, "id", ""))) for x in archive]
+    archive_ids = [archive_entry_id(x) for x in archive]
     prior_ids = get(prior_state, "archive_ids", nothing)
     reusable_ids = get(reusable, "archive_ids", nothing)
     selected_ids = get(reusable, "selected_archive_ids", nothing)
@@ -797,7 +815,7 @@ function load_immediate_predecessor_state(cfg::OptimizerConfig, stage::StageConf
     String(get(lineage, "canonical_archive_path", "")) ==
         abspath(joinpath(root, "survivor_archive.json")) ||
         throw(ArgumentError("trusted predecessor archive lineage path mismatch"))
-    get(lineage, "archive_ids", Any[]) == archive_ids ||
+    string.(get(lineage, "archive_ids", Any[])) == archive_ids ||
         throw(ArgumentError("trusted predecessor archive lineage IDs mismatch"))
     return Dict{String,Any}(
         "stage_state" => prior_state,
@@ -926,6 +944,9 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         row isa AbstractDict || (push!(contradictions, "non-object iter_metrics row"); continue)
         identity = (String(get(row, "stage", "")), Int(get(row, "iteration", 0)),
             candidate_int(get(row, "candidate", 0)))
+        haskey(row, "archive_entry_id") && archive_entry_id(row) !=
+            archive_entry_id(identity...) &&
+            push!(contradictions, "iter_metrics archive_entry_id mismatch: $identity")
         identity in identities && push!(contradictions, "duplicate iter_metrics identity: $identity")
         push!(identities, identity)
         status_by_id[identity] = String(get(row, "status", ""))
@@ -936,6 +957,9 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
         entry isa AbstractDict || (push!(contradictions, "$label is not an object"); return nothing)
         identity = (String(get(entry, "stage", "")), Int(get(entry, "iteration", 0)),
             candidate_int(get(entry, "candidate", 0)))
+        haskey(entry, "archive_entry_id") && archive_entry_id(entry) !=
+            archive_entry_id(identity...) &&
+            push!(contradictions, "$label archive_entry_id mismatch: $identity")
         identity in identities || push!(contradictions, "$label orphan identity: $identity")
         identity[1] == stage || push!(contradictions, "$label stage mismatch: $identity")
         if require_current_iteration
@@ -974,7 +998,7 @@ function validate_committed_artifacts(stage_root::String, expected_schema::Abstr
     admitted = get(reusable, "archive_ids", Any[])
     admitted isa AbstractVector || push!(contradictions, "reusable state archive_ids is not an array")
     for id in admitted
-        any(string(get(e, "candidate", get(e, "id", ""))) == string(id) for e in archive) ||
+        any(archive_entry_id(e) == string(id) for e in archive) ||
             push!(contradictions, "reusable state references non-admitted archive id: $id")
     end
     counts = Dict("completed" => 0, "failed" => 0, "skipped" => 0, "pending" => 0)
@@ -1154,13 +1178,14 @@ function survivor_archive_update(existing, entries;
         reason = _archive_rejection_reason(entry;
             current_stage=current_stage, current_fit_months=current_fit_months)
         reason !== nothing && (rejected[reason] = get(rejected, reason, 0) + 1; continue)
-        id = string(get(entry, "candidate", get(entry, "id", "")))
+        archived_entry = _set_archive_entry_id!(deepcopy(entry))
+        id = archive_entry_id(archived_entry)
         if !isempty(id) && id in seen
             rejected["duplicate"] = get(rejected, "duplicate", 0) + 1
             continue
         end
         !isempty(id) && push!(seen, id)
-        push!(pool, deepcopy(entry))
+        push!(pool, archived_entry)
     end
     isempty(pool) && return return_report ? Dict{String,Any}(
         "archive" => Any[], "archive_count" => 0, "configured_target" => target_size,
@@ -1318,7 +1343,7 @@ function persist_archive_transfer_manifest(stage_root::String, archive;
                                            stage::Union{Nothing,String}=nothing,
                                            fit_months::Union{Nothing,Int}=nothing)
     values = archive isa AbstractVector ? collect(archive) : Any[]
-    ids = [string(get(x, "candidate", get(x, "id", ""))) for x in values if x isa AbstractDict]
+    ids = [archive_entry_id(x) for x in values if x isa AbstractDict]
     payload_hash = _archive_payload_hash(values)
     source = stage === nothing ? basename(stage_root) : stage
     manifest = Dict{String,Any}(
@@ -1452,12 +1477,14 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
             return reject("expected_horizon_mismatch")
         manifest["admitted_ids"] isa AbstractVector || return reject("admitted_ids_invalid")
         manifest["admitted_order"] isa AbstractVector || return reject("admitted_order_invalid")
-        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_ids"]) ||
+        valid_legacy_id(x) = (x isa AbstractString && !isempty(x)) ||
+            (x isa Integer && !(x isa Bool))
+        all(valid_legacy_id, manifest["admitted_ids"]) ||
             return reject("admitted_ids_invalid")
-        all(x -> x isa AbstractString && !isempty(x), manifest["admitted_order"]) ||
+        all(valid_legacy_id, manifest["admitted_order"]) ||
             return reject("admitted_order_invalid")
-        admitted_ids = String.(manifest["admitted_ids"])
-        admitted_order = String.(manifest["admitted_order"])
+        admitted_ids = string.(manifest["admitted_ids"])
+        admitted_order = string.(manifest["admitted_order"])
         admitted_ids == admitted_order || return reject("admitted_order_mismatch")
         length(unique(admitted_ids)) == length(admitted_ids) ||
             return reject("duplicate_admitted_ids")
@@ -1467,8 +1494,15 @@ function load_transfer_survivor_archive(output_dir::String, current_stage::Strin
         all(x -> x isa AbstractDict, values) || return reject("malformed_archive")
         payload_ids = String[]
         for x in values
-            haskey(x, "candidate") || haskey(x, "id") || return reject("archive_id_missing")
-            id = haskey(x, "candidate") ? x["candidate"] : x["id"]
+            haskey(x, "archive_entry_id") || haskey(x, "candidate") || haskey(x, "id") ||
+                return reject("archive_id_missing")
+            id = archive_entry_id(x)
+            if haskey(x, "archive_entry_id")
+                all(haskey(x, key) for key in ("stage", "iteration", "candidate")) ||
+                    return reject("archive_entry_identity_incomplete")
+                id == archive_entry_id(x["stage"], x["iteration"], x["candidate"]) ||
+                    return reject("archive_entry_identity_mismatch")
+            end
             (id isa AbstractString || id isa Integer) || return reject("archive_id_invalid")
             id isa AbstractString && isempty(id) && return reject("archive_id_invalid")
             push!(payload_ids, String(id))
@@ -1727,7 +1761,7 @@ function enforce_posterior_reusable_state(
     report["active_months"] = active_months
     report["source_provenance"] = source_entry isa AbstractDict ?
         Dict{String,Any}(
-            "archive_entry_id" => get(source_entry, "candidate", nothing),
+            "archive_entry_id" => archive_entry_id(source_entry),
             "source_stage" => get(source_entry, "stage", nothing),
             "source_fit_months" => get(source_entry, "fit_months", nothing),
         ) :
@@ -2048,6 +2082,9 @@ function load_config(path::String)
     validation = haskey(raw, "validation") ?
         Dict(String(k) => v for (k, v) in raw["validation"]) :
         Dict{String,Any}("enabled" => true, "holdout_days" => 28, "seeds" => [42, 43, 44])
+    validation_mode = String(get(validation, "mode", "legacy"))
+    validation_mode in ("legacy", "reconstruction", "forecast") ||
+        error("validation.mode must be reconstruction or forecast")
     temporal_parameterization = String(get(raw, "temporal_parameterization", "monthly"))
     temporal_parameterization in ("weekly", "monthly", "events") ||
         error("Unsupported temporal_parameterization: $(temporal_parameterization)")
@@ -3488,6 +3525,8 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     # Validation carries structured diagnostics (window, retained indices,
     # and per-metric scores), so keep the score manifest heterogeneous.
     metrics = Dict{String,Any}()
+    metrics["protocol_mode"] = windows["protocol_mode"]
+    metrics["objective_window"] = copy(windows["train"])
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), training_days)
@@ -3520,6 +3559,8 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     # The validation window is a structured diagnostic, not a scalar metric.
     # A heterogeneous payload prevents assigning it to a Float64-only dict.
     metrics = Dict{String,Any}()
+    metrics["protocol_mode"] = windows["protocol_mode"]
+    metrics["objective_window"] = copy(windows["train"])
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, training_days)
@@ -3731,6 +3772,8 @@ end
 
 """Choose the CMA ranking loss without discarding the training objective."""
 function candidate_selection_score(cfg::OptimizerConfig, training_score::Real, metrics::AbstractDict)
+    String(get(cfg.validation, "mode", "legacy")) == "reconstruction" &&
+        return Float64(training_score)
     Bool(get(cfg.validation, "rank_on_validation", false)) || return Float64(training_score)
     configured = get(cfg.validation, "selection_objective_weights", nothing)
     if configured !== nothing
@@ -4004,6 +4047,8 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
     if cfg.external_sim !== nothing
         daily_path = joinpath(workdir, "output_daily.jld2")
         if isfile(daily_path)
+            windows = stage_data_split(days, cfg.validation)
+            objective_days = Int(windows["train"]["end_day"])
             weekly_absolute_errors = Dict{String,Any}()
             weekly_normalized_absolute_errors = Dict{String,Any}()
             weekly_mae = Dict{String,Any}()
@@ -4012,7 +4057,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
             weekly_observations = Dict{String,Any}()
             weekly_predictions = Dict{String,Any}()
             for (metric, gtvals) in load_gt_series(cfg.external_sim.gt_dir)
-                errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                errors = weekly_error_distributions(daily_path, metric, gtvals, objective_days)
                 weekly_absolute_errors[metric] = errors["absolute_error"]
                 weekly_normalized_absolute_errors[metric] = errors["normalized_absolute_error"]
                 weekly_mae[metric] = errors["mae"]
@@ -4022,7 +4067,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
                 weekly_predictions[metric] = errors["predictions"]
             end
             result["vector_likelihood"] = vector_likelihood_payload(
-                daily_path, load_gt_series(cfg.external_sim.gt_dir), days;
+                daily_path, load_gt_series(cfg.external_sim.gt_dir), objective_days;
                 family=cfg.posterior.likelihood,
                 metric_names=likelihood_metric_names(cfg),
                 dispersions=likelihood_dispersions(cfg),
@@ -4316,6 +4361,7 @@ function append_cma_candidate_record(
         "stage" => stage.name,
         "iteration" => iteration,
         "candidate" => candidate_id,
+        "archive_entry_id" => archive_entry_id(stage.name, iteration, candidate_id),
         "parameter_names" => parameter_names,
         "x_raw" => raw_candidate,
         "x_evaluated" => evaluated_candidate,
@@ -4681,6 +4727,8 @@ function run_stage(
                 elseif isfile(daily_path)
                     combined, comp = score_from_daily(cfg, daily_path, days, cand_cfg)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
+                    windows = stage_data_split(days, cfg.validation)
+                    objective_days = Int(windows["train"]["end_day"])
                     bucket_errors = Dict{String,Any}()
                     weekly_absolute_errors = Dict{String,Any}()
                     weekly_normalized_absolute_errors = Dict{String,Any}()
@@ -4691,12 +4739,12 @@ function run_stage(
                     weekly_predictions = Dict{String,Any}()
                     household = household_readout(daily_path, days)
                     vector_likelihood = vector_likelihood_payload(
-                        daily_path, gt, days; family=cfg.posterior.likelihood,
+                        daily_path, gt, objective_days; family=cfg.posterior.likelihood,
                         metric_names=likelihood_metric_names(cfg),
                         dispersions=likelihood_dispersions(cfg)
                     )
                     for (metric, gtvals) in gt
-                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, objective_days)
                         weekly_absolute_errors[metric] = weekly_errors["absolute_error"]
                         weekly_normalized_absolute_errors[metric] = weekly_errors["normalized_absolute_error"]
                         weekly_mae[metric] = weekly_errors["mae"]
@@ -4708,6 +4756,8 @@ function run_stage(
                     metrics_payload = Dict(
                         "schema_version" => "experiment-v1",
                         "experiment_type" => "cma_candidate",
+                        "protocol_mode" => windows["protocol_mode"],
+                        "objective_window" => windows["train"],
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
                         "daily_hospitalizations" => comp["daily_hospitalizations"],
@@ -4716,12 +4766,12 @@ function run_stage(
                         "daily_hospitalizations_cumulative" => comp["daily_hospitalizations_cumulative"],
                         "daily_deaths_cumulative" => comp["daily_deaths_cumulative"],
                         "weekly_control_score" => comp["weekly_control_score"],
-                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], days),
-                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
-                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], days),
-                        "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], days),
-                        "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
-                        "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
+                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], objective_days),
+                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], objective_days),
+                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], objective_days),
+                        "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], objective_days),
+                        "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], objective_days),
+                        "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], objective_days),
                         "weekly_absolute_errors" => weekly_absolute_errors,
                         "weekly_normalized_absolute_errors" => weekly_normalized_absolute_errors,
                         "weekly_mae" => weekly_mae,
@@ -4737,15 +4787,15 @@ function run_stage(
                     for spec in specs_stage
                         spec.kind == :temporal || continue
                         bucket_errors[spec.name] = weekly_control_bucket_errors(
-                            daily_path, gt, days, spec, active_months, cfg
+                            daily_path, gt, objective_days, spec, active_months, cfg
                         )
                     end
                     metrics_payload["bucket_errors"] = bucket_errors
                     if haskey(comp, "daily_student_detections")
                         metrics_payload["daily_student_detections"] = comp["daily_student_detections"]
                         metrics_payload["daily_student_detections_cumulative"] = get(comp, "daily_student_detections_cumulative", NaN)
-                        metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
-                        metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
+                        metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], objective_days)
+                        metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], objective_days)
                     end
                     if haskey(comp, "household_infections")
                         metrics_payload["household_infections"] = comp["household_infections"]
@@ -4775,6 +4825,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "score" => score,
                     "simulated" => metrics["simulated"],
@@ -4792,6 +4843,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4803,6 +4855,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4815,7 +4868,7 @@ function run_stage(
                     "provenance" => Dict{String,Any}(
                         "source" => is_incumbent ? "stage_incumbent" :
                             (transfer_entry === nothing ? "cma_population" : "predecessor_archive"),
-                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : archive_entry_id(transfer_entry),
                         "candidate_class" => candidate_class,
                     ),
                 )
@@ -4918,6 +4971,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4928,6 +4982,7 @@ function run_stage(
                     "stage" => stage.name,
                     "iteration" => iter,
                     "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "search_policy" => policy.name,
                     "fit_months" => active_months,
                     "score" => score,
@@ -4940,7 +4995,7 @@ function run_stage(
                     "provenance" => Dict{String,Any}(
                         "source" => is_incumbent ? "stage_incumbent" :
                             (transfer_entry === nothing ? "cma_population" : "predecessor_archive"),
-                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : get(transfer_entry, "candidate", nothing),
+                        "predecessor_archive_entry" => transfer_entry === nothing ? nothing : archive_entry_id(transfer_entry),
                         "candidate_class" => candidate_class,
                     ),
                 )
@@ -4956,6 +5011,7 @@ function run_stage(
                 end
                 push!(local_iter_records, Dict(
                     "stage" => stage.name, "iteration" => iter, "candidate" => ci,
+                    "archive_entry_id" => archive_entry_id(stage.name, iter, ci),
                     "status" => get(metrics, "status", "unknown"),
                     "score" => score,
                     "threshold_reached" => false,
@@ -5070,7 +5126,7 @@ function run_stage(
             archive_report; label="survivor_archive_summary")
         reusable_payload = full_reusable_state_from_cma(stage, specs_stage, state;
             transition_report=stage_transition_report)
-        archive_ids = [get(entry, "candidate", nothing) for entry in survivor_archive]
+        archive_ids = [archive_entry_id(entry) for entry in survivor_archive]
         reusable_payload["event_calendar"] = calendar_metadata
         reusable_payload["historical_trajectory"] = trusted_trajectory
         reusable_payload["trajectory_identity"] = trusted_trajectory["identity"]
@@ -5288,12 +5344,12 @@ function run_optimizer(config_path::String; use_slurm::Bool=false)
                     posterior_state = posterior_transition["state"]
                     posterior_state["archive_provenance"] = posterior_source === nothing ? nothing :
                         Dict{String,Any}("source_archive_path" => posterior_archive_path,
-                                         "source_archive_entry" => get(posterior_source, "candidate", nothing),
+                                         "source_archive_entry" => archive_entry_id(posterior_source),
                                          "source_stage" => get(posterior_source, "stage", nothing),
                                          "predecessor" => "immediate_admitted_archive")
                     posterior_state["predecessor_provenance"] = posterior_source === nothing ? nothing :
                         Dict{String,Any}("archive_path" => posterior_archive_path,
-                                         "archive_entry_id" => get(posterior_source, "candidate", nothing),
+                                         "archive_entry_id" => archive_entry_id(posterior_source),
                                          "stage" => get(posterior_source, "stage", nothing),
                                          "horizon_months" => get(posterior_source, "fit_months", stage.fit_months))
                     state = build_state_from_reusable(

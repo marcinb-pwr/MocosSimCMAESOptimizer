@@ -1,6 +1,7 @@
 {
   "temporal_parameterization": "monthly",
   "validation": {
+    "mode": "forecast",
     "enabled": false,
     "stage_validation_days": 28,
     "adapter_timeout_seconds": 900,

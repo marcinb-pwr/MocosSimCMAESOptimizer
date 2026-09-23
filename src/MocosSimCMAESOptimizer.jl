@@ -2057,6 +2057,9 @@ function load_config(path::String)
     validation = haskey(raw, "validation") ?
         Dict(String(k) => v for (k, v) in raw["validation"]) :
         Dict{String,Any}("enabled" => true, "holdout_days" => 28, "seeds" => [42, 43, 44])
+    validation_mode = String(get(validation, "mode", "legacy"))
+    validation_mode in ("legacy", "reconstruction", "forecast") ||
+        error("validation.mode must be reconstruction or forecast")
     temporal_parameterization = String(get(raw, "temporal_parameterization", "monthly"))
     temporal_parameterization in ("weekly", "monthly") ||
         error("Unsupported temporal_parameterization: $(temporal_parameterization)")
@@ -3449,6 +3452,8 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     # Validation carries structured diagnostics (window, retained indices,
     # and per-metric scores), so keep the score manifest heterogeneous.
     metrics = Dict{String,Any}()
+    metrics["protocol_mode"] = windows["protocol_mode"]
+    metrics["objective_window"] = copy(windows["train"])
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, drop_missing(gtvals), training_days)
@@ -3481,6 +3486,8 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     # The validation window is a structured diagnostic, not a scalar metric.
     # A heterogeneous payload prevents assigning it to a Float64-only dict.
     metrics = Dict{String,Any}()
+    metrics["protocol_mode"] = windows["protocol_mode"]
+    metrics["objective_window"] = copy(windows["train"])
     for (metric, gtvals) in gt
         isempty(gtvals) && continue
         metrics[metric] = per_trajectory_rmae(daily_path, metric, gtvals, training_days)
@@ -3692,6 +3699,8 @@ end
 
 """Choose the CMA ranking loss without discarding the training objective."""
 function candidate_selection_score(cfg::OptimizerConfig, training_score::Real, metrics::AbstractDict)
+    String(get(cfg.validation, "mode", "legacy")) == "reconstruction" &&
+        return Float64(training_score)
     Bool(get(cfg.validation, "rank_on_validation", false)) || return Float64(training_score)
     configured = get(cfg.validation, "selection_objective_weights", nothing)
     if configured !== nothing
@@ -3965,6 +3974,8 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
     if cfg.external_sim !== nothing
         daily_path = joinpath(workdir, "output_daily.jld2")
         if isfile(daily_path)
+            windows = stage_data_split(days, cfg.validation)
+            objective_days = Int(windows["train"]["end_day"])
             weekly_absolute_errors = Dict{String,Any}()
             weekly_normalized_absolute_errors = Dict{String,Any}()
             weekly_mae = Dict{String,Any}()
@@ -3973,7 +3984,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
             weekly_observations = Dict{String,Any}()
             weekly_predictions = Dict{String,Any}()
             for (metric, gtvals) in load_gt_series(cfg.external_sim.gt_dir)
-                errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                errors = weekly_error_distributions(daily_path, metric, gtvals, objective_days)
                 weekly_absolute_errors[metric] = errors["absolute_error"]
                 weekly_normalized_absolute_errors[metric] = errors["normalized_absolute_error"]
                 weekly_mae[metric] = errors["mae"]
@@ -3983,7 +3994,7 @@ function score_candidate(candidate::Dict{String,Any}, cfg::OptimizerConfig, days
                 weekly_predictions[metric] = errors["predictions"]
             end
             result["vector_likelihood"] = vector_likelihood_payload(
-                daily_path, load_gt_series(cfg.external_sim.gt_dir), days;
+                daily_path, load_gt_series(cfg.external_sim.gt_dir), objective_days;
                 family=cfg.posterior.likelihood,
                 metric_names=likelihood_metric_names(cfg),
                 dispersions=likelihood_dispersions(cfg),
@@ -4637,6 +4648,8 @@ function run_stage(
                 elseif isfile(daily_path)
                     combined, comp = score_from_daily(cfg, daily_path, days, cand_cfg)
                     gt = load_gt_series(cfg.external_sim.gt_dir)
+                    windows = stage_data_split(days, cfg.validation)
+                    objective_days = Int(windows["train"]["end_day"])
                     bucket_errors = Dict{String,Any}()
                     weekly_absolute_errors = Dict{String,Any}()
                     weekly_normalized_absolute_errors = Dict{String,Any}()
@@ -4647,12 +4660,12 @@ function run_stage(
                     weekly_predictions = Dict{String,Any}()
                     household = household_readout(daily_path, days)
                     vector_likelihood = vector_likelihood_payload(
-                        daily_path, gt, days; family=cfg.posterior.likelihood,
+                        daily_path, gt, objective_days; family=cfg.posterior.likelihood,
                         metric_names=likelihood_metric_names(cfg),
                         dispersions=likelihood_dispersions(cfg)
                     )
                     for (metric, gtvals) in gt
-                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, days)
+                        weekly_errors = weekly_error_distributions(daily_path, metric, gtvals, objective_days)
                         weekly_absolute_errors[metric] = weekly_errors["absolute_error"]
                         weekly_normalized_absolute_errors[metric] = weekly_errors["normalized_absolute_error"]
                         weekly_mae[metric] = weekly_errors["mae"]
@@ -4664,6 +4677,8 @@ function run_stage(
                     metrics_payload = Dict(
                         "schema_version" => "experiment-v1",
                         "experiment_type" => "cma_candidate",
+                        "protocol_mode" => windows["protocol_mode"],
+                        "objective_window" => windows["train"],
                         "score" => combined,
                         "daily_detections" => comp["daily_detections"],
                         "daily_hospitalizations" => comp["daily_hospitalizations"],
@@ -4672,12 +4687,12 @@ function run_stage(
                         "daily_hospitalizations_cumulative" => comp["daily_hospitalizations_cumulative"],
                         "daily_deaths_cumulative" => comp["daily_deaths_cumulative"],
                         "weekly_control_score" => comp["weekly_control_score"],
-                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], days),
-                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
-                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], days),
-                        "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], days),
-                        "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], days),
-                        "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], days),
+                        "daily_detections_per_trajectory" => trajectory_metric_values(daily_path, "daily_detections", gt["daily_detections"], objective_days),
+                        "daily_hospitalizations_per_trajectory" => trajectory_metric_values(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], objective_days),
+                        "daily_deaths_per_trajectory" => trajectory_metric_values(daily_path, "daily_deaths", gt["daily_deaths"], objective_days),
+                        "daily_detections_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_detections", gt["daily_detections"], objective_days),
+                        "daily_hospitalizations_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_hospitalizations", gt["daily_hospitalizations"], objective_days),
+                        "daily_deaths_cumulative_per_trajectory" => cumulative_error_distribution(daily_path, "daily_deaths", gt["daily_deaths"], objective_days),
                         "weekly_absolute_errors" => weekly_absolute_errors,
                         "weekly_normalized_absolute_errors" => weekly_normalized_absolute_errors,
                         "weekly_mae" => weekly_mae,
@@ -4693,15 +4708,15 @@ function run_stage(
                     for spec in specs_stage
                         spec.kind == :temporal || continue
                         bucket_errors[spec.name] = weekly_control_bucket_errors(
-                            daily_path, gt, days, spec, active_months, cfg
+                            daily_path, gt, objective_days, spec, active_months, cfg
                         )
                     end
                     metrics_payload["bucket_errors"] = bucket_errors
                     if haskey(comp, "daily_student_detections")
                         metrics_payload["daily_student_detections"] = comp["daily_student_detections"]
                         metrics_payload["daily_student_detections_cumulative"] = get(comp, "daily_student_detections_cumulative", NaN)
-                        metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
-                        metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], days)
+                        metrics_payload["daily_student_detections_per_trajectory"] = trajectory_metric_values(daily_path, "daily_student_detections", gt["daily_student_detections"], objective_days)
+                        metrics_payload["daily_student_detections_cumulative_per_trajectory"] = cumulative_error_distribution(daily_path, "daily_student_detections", gt["daily_student_detections"], objective_days)
                     end
                     if haskey(comp, "household_infections")
                         metrics_payload["household_infections"] = comp["household_infections"]

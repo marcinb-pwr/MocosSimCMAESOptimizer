@@ -1,6 +1,7 @@
 {
   "temporal_parameterization": "monthly",
   "validation": {
+    "mode": "forecast",
     "enabled": true,
     "holdout_days": 28,
     "seeds": [42, 43, 44]

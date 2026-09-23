@@ -39,6 +39,8 @@ end
 export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        run_nuts_from_stage, posterior_reusable_state, safe_save_json,
        survivor_archive_update, archive_quality_gate, load_transfer_survivor_archive,
+       evaluate_quality_gates!, append_qualified_candidate_registry!,
+       load_qualified_candidate_registry,
        persist_archive_transfer_manifest, archive_entry_id, preflight_config, create_candidate_root,
        adapter_failure, candidate_terminal_status, wait_for_iteration_outputs,
        stage_resume_info, materialize_terminal_candidate!, normalized_iteration_result,
@@ -1078,6 +1080,85 @@ const SURVIVOR_ARCHIVE_SIZE = 200
 const SURVIVOR_MIN_DISTANCE = 0.03
 const SURVIVOR_SCORE_MAD_MULTIPLIER = 2.0
 const SURVIVOR_RELATIVE_SCORE_FLOOR = 0.05
+const QUALITY_GATE_THRESHOLDS = (0.50, 0.30, 0.20, 0.10)
+
+"""Store independent detection/death and trajectory/final-sum quality gates."""
+function evaluate_quality_gates!(metrics::AbstractDict; thresholds=QUALITY_GATE_THRESHOLDS)
+    definitions = (("detections", "trajectory", "daily_detections"),
+        ("detections", "final_sum", "daily_detections_cumulative"),
+        ("deaths", "trajectory", "daily_deaths"),
+        ("deaths", "final_sum", "daily_deaths_cumulative"))
+    gates, achieved = Any[], Float64[]
+    for raw_threshold in thresholds
+        threshold = Float64(raw_threshold)
+        components = Dict{String,Any}()
+        passed = true
+        for (series, kind, metric_name) in definitions
+            value = try Float64(get(metrics, metric_name, Inf)) catch; Inf end
+            component_passed = isfinite(value) && value <= threshold
+            components["$(series)_$(kind)"] = Dict{String,Any}(
+                "metric" => metric_name, "value" => value,
+                "threshold" => threshold, "passed" => component_passed)
+            passed &= component_passed
+        end
+        push!(gates, Dict{String,Any}("threshold" => threshold,
+            "passed" => passed, "components" => components))
+        passed && push!(achieved, threshold)
+    end
+    result = Dict{String,Any}("schema_version" => "quality-gates-v1",
+        "gates" => gates, "achieved_levels" => achieved,
+        "best_level" => isempty(achieved) ? nothing : minimum(achieved))
+    metrics["quality_gates"] = result
+    return result
+end
+
+function load_qualified_candidate_registry(path::String)
+    isfile(path) || return Any[]
+    rows = Any[]
+    for line in eachline(path)
+        isempty(strip(line)) || push!(rows, JSON.parse(line))
+    end
+    return rows
+end
+
+"""Append each newly qualified archive identity; existing rows are immutable."""
+function append_qualified_candidate_registry!(path::String, entries;
+        seeds=Any[], data_hash=nothing, calendar_hash=nothing)
+    existing = load_qualified_candidate_registry(path)
+    seen = Set(string(get(row, "archive_entry_id", "")) for row in existing)
+    appended = Any[]
+    for source in entries
+        source isa AbstractDict || continue
+        entry = deepcopy(source)
+        raw_metrics = get(entry, "metrics", Dict{String,Any}())
+        metrics = raw_metrics isa AbstractDict && haskey(raw_metrics, "metrics") ?
+            raw_metrics["metrics"] : raw_metrics
+        metrics isa AbstractDict || continue
+        gates = haskey(metrics, "quality_gates") ? metrics["quality_gates"] :
+            evaluate_quality_gates!(metrics)
+        levels = get(gates, "achieved_levels", Any[])
+        isempty(levels) && continue
+        identity = Dict("stage" => get(entry, "stage", nothing),
+            "iteration" => get(entry, "iteration", nothing),
+            "candidate" => get(entry, "candidate", nothing),
+            "evaluated_vector" => get(entry, "evaluated_vector", Any[]))
+        id = string(get(entry, "archive_entry_id",
+            bytes2hex(SHA.sha256(JSON.json(identity)))))
+        id in seen && continue
+        entry["archive_entry_id"] = id
+        entry["achieved_quality_levels"] = deepcopy(levels)
+        entry["quality_gates"] = deepcopy(gates)
+        entry["parameters"] = deepcopy(get(entry, "evaluated_vector", Any[]))
+        entry["used_seeds"] = deepcopy(get(entry, "used_seeds", seeds))
+        entry["horizon"] = get(entry, "fit_months", get(entry, "effective_scoring_horizon", nothing))
+        entry["data_hash"] = get(entry, "data_hash", data_hash)
+        entry["calendar_hash"] = get(entry, "calendar_hash", calendar_hash)
+        entry["registered_at"] = string(Dates.now())
+        append_jsonl(path, entry)
+        push!(seen, id); push!(appended, entry)
+    end
+    return appended
+end
 
 function archive_metric(entry::AbstractDict, name::String)
     metrics = get(entry, "metrics", Dict{String,Any}())
@@ -3609,6 +3690,7 @@ function score_with_real_sim(cfg::OptimizerConfig, candidate::Dict{String,Any}, 
     validation = validation_score_from_daily(cfg, daily_path, days)
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
+    evaluate_quality_gates!(metrics)
     return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty), metrics
 end
 
@@ -3646,6 +3728,7 @@ function score_from_daily(cfg::OptimizerConfig, daily_path::String, days::Int, c
     validation = validation_score_from_daily(cfg, daily_path, days)
     metrics["validation_mean_error"] = Float64(get(validation, "mean_error", Inf))
     metrics["validation_window"] = validation
+    evaluate_quality_gates!(metrics)
     return objective_score(cfg, metrics, weekly_control, jump_penalty, extrema_penalty), metrics
 end
 
@@ -4649,6 +4732,7 @@ function run_stage(
     best_candidate = resume_state === nothing ? deepcopy(seed) :
         deepcopy(get(resume_state, "best_candidate_config", seed))
     archive_path = joinpath(stage_root, "survivor_archive.json")
+    registry_path = joinpath(stage_root, "qualified_candidate_registry.jsonl")
     survivor_archive = isfile(archive_path) ? load_json(archive_path) : Any[]
     survivor_archive isa AbstractVector || (survivor_archive = Any[])
     transfer_archive = received_prior ? deepcopy(predecessor_archive) : Any[]
@@ -4879,6 +4963,7 @@ function run_stage(
                         "vector_likelihood" => vector_likelihood,
                         "household_infections" => household["household_infections"],
                         "household_infection_rate" => household["household_infection_rate"],
+                        "quality_gates" => comp["quality_gates"],
                         "simulated" => "real",
                     )
                     for spec in specs_stage
@@ -5209,8 +5294,19 @@ function run_stage(
         # resume.  It is replaced only after the iteration has been fully
         # evaluated and is covered by the commit hash manifest.
         safe_save_json(joinpath(stage_root, "top_candidates.json"), iteration_top_payload; label="stage_top_candidates")
+        data_hash = cfg.external_sim === nothing ? nothing : bytes2hex(SHA.sha256(join(
+            [bytes2hex(SHA.sha256(read(joinpath(cfg.external_sim.gt_dir, file))))
+             for file in sort(readdir(cfg.external_sim.gt_dir))
+             if isfile(joinpath(cfg.external_sim.gt_dir, file))], ":")))
+        calendar_hash = bytes2hex(SHA.sha256(JSON.json(Dict(
+            "monthly_days" => cfg.monthly_days, "fit_months" => active_months,
+            "simulation_days" => days))))
+        append_qualified_candidate_registry!(registry_path, iteration_top_candidates;
+            seeds=get(cfg.validation, "seeds", [42, 43, 44]),
+            data_hash=data_hash, calendar_hash=calendar_hash)
+        qualified_registry = load_qualified_candidate_registry(registry_path)
         archive_report = survivor_archive_update(
-            survivor_archive, iteration_top_candidates;
+            Any[], qualified_registry;
             current_stage=stage.name, current_fit_months=active_months,
             target_size=40, max_size=SURVIVOR_ARCHIVE_SIZE,
             return_report=true,

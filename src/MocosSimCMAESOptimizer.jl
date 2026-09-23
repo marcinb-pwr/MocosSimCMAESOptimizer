@@ -16,6 +16,7 @@ const CMA_SIGMA_MIN = 0.02
 const CMA_SIGMA_MAX = 0.20
 const NEW_TEMPORAL_VARIANCE = 0.04
 
+include("event_calendar.jl")
 """Return the globally unique identity of one archive evaluation."""
 archive_entry_id(stage, iteration, candidate) = string(stage, ":", iteration, ":", candidate)
 
@@ -46,7 +47,9 @@ export main, run_optimizer, run_long_horizon, run_nuts_from_archive,
        canonical_data_protocol, temporal_data_split,
        stage_data_split, negative_binomial_loglikelihood,
        run_production_smoke, validate_simulation_jld2,
-       compare_smoke_manifests
+       compare_smoke_manifests, load_event_calendar, validate_event_calendar,
+       event_change_points, event_calendar_metadata, assert_event_calendar_resume!,
+       seasonal_out_of_household_multiplier, apply_event_seasonality!
 
 struct ExternalSimConfig
     gt_dir::String
@@ -123,6 +126,8 @@ struct OptimizerConfig
     initial_state::Union{Nothing,Dict{String,Any}}
     posterior::PosteriorConfig
     runtime_seed::Dict{String,Any}
+    event_calendar::Union{Nothing,EventCalendar}
+    event_seasonality::Dict{String,Any}
 end
 
 # Backwards-compatible constructor for fixture/config callers that do not
@@ -135,6 +140,16 @@ OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
                     temporal_bounds, scalar_preprocessing, temporal_parameterization,
                     age_population_weights, validation, objective, external_sim,
                     stage_freeze, initial_state, posterior,
+                    Dict{String,Any}(), nothing, Dict{String,Any}())
+
+OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                age_population_weights, validation, objective, external_sim,
+                stage_freeze, initial_state, posterior, runtime_seed, event_calendar) =
+    OptimizerConfig(seed_config, output_dir, monthly_days, stages, scalar_bounds,
+                    temporal_bounds, scalar_preprocessing, temporal_parameterization,
+                    age_population_weights, validation, objective, external_sim,
+                    stage_freeze, initial_state, posterior, runtime_seed, event_calendar,
                     Dict{String,Any}())
 
 const DEFAULT_AGE_POPULATION_WEIGHTS = Dict{String,Float64}(
@@ -1526,7 +1541,7 @@ function stage_vector_from_config(seed::AbstractDict, cfg::AbstractDict,
                                   specs_stage::Vector{ParamSpec})
     projected = deepcopy(cfg isa Dict{String,Any} ? cfg : Dict{String,Any}(cfg))
     if CURRENT_OPTIMIZER_CONFIG[] !== nothing &&
-       CURRENT_OPTIMIZER_CONFIG[].temporal_parameterization == "monthly"
+       CURRENT_OPTIMIZER_CONFIG[].temporal_parameterization in ("monthly", "events")
         for spec in specs_stage
             spec.kind == :temporal || continue
             times_path = replace(spec.name, "interval_values" => "interval_times")
@@ -1555,7 +1570,17 @@ function stage_vector_to_config(seed::AbstractDict, cfg::AbstractDict,
             idx += 1
         else
             current = collect(Float64.(get_nested(effective_cfg, spec.name)))
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                times_path = replace(spec.name, "interval_values" => "interval_times")
+                interval_times = try get_nested(effective_cfg, times_path) catch; get_nested(seed_dict, times_path); end
+                points = event_change_points(optcfg.event_calendar, event_category_for_parameter(spec.name))
+                for i in eachindex(current)
+                    bucket = findlast(p -> p.day <= Int(ceil(Float64(interval_times[min(i,length(interval_times))]))), points)
+                    bucket === nothing || (spec.offset <= bucket < spec.offset + spec.length &&
+                        (current[i] = values[idx + bucket - spec.offset]))
+                end
+                idx += spec.length
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 times_path = replace(spec.name, "interval_values" => "interval_times")
                 interval_times = try get_nested(effective_cfg, times_path) catch
                     get_nested(seed_dict, times_path)
@@ -2061,11 +2086,22 @@ function load_config(path::String)
     validation_mode in ("legacy", "reconstruction", "forecast") ||
         error("validation.mode must be reconstruction or forecast")
     temporal_parameterization = String(get(raw, "temporal_parameterization", "monthly"))
-    temporal_parameterization in ("weekly", "monthly") ||
+    temporal_parameterization in ("weekly", "monthly", "events") ||
         error("Unsupported temporal_parameterization: $(temporal_parameterization)")
     runtime_seed = load_json(raw["seed_config"])
     _normalize_seed_paths!(runtime_seed, dirname(raw["seed_config"]))
-    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed)
+    calendar = if temporal_parameterization == "events"
+        haskey(raw, "event_calendar") || error("event_calendar is required for event parameterization")
+        value = _expand_environment_variables(String(raw["event_calendar"]), "event_calendar")
+        load_event_calendar(isabspath(value) ? value : normpath(joinpath(config_dir, value)))
+    else
+        nothing
+    end
+    seasonality = Dict{String,Any}(String(k)=>v for (k,v) in get(raw, "event_seasonality", Dict{String,Any}()))
+    temporal_parameterization == "events" && validate_event_seasonality(seasonality)
+    temporal_parameterization != "events" && Bool(get(seasonality, "enabled", false)) &&
+        throw(ArgumentError("event_seasonality requires temporal_parameterization=events"))
+    return OptimizerConfig(raw["seed_config"], raw["output_dir"], Int(raw["monthly_days"]), stages, scalar_bounds, temporal_bounds, scalar_preprocessing, temporal_parameterization, age_population_weights, validation, objective, external_sim, stage_freeze, initial_state, posterior, runtime_seed, calendar, seasonality)
 end
 
 function scalar_preprocessing_entry(cfg::OptimizerConfig, spec::ParamSpec)
@@ -2165,7 +2201,14 @@ function build_specs(seed::Dict{String,Any}, cfg::OptimizerConfig)
     end
     for (name, (lo, hi)) in sort(collect(cfg.temporal_bounds), by=first)
         arr = get_nested(seed, name)
-        push!(specs, ParamSpec(name, :temporal, length(arr), lo, hi))
+        length_ = if cfg.temporal_parameterization == "events"
+            category = event_category_for_parameter(name)
+            category === nothing && throw(ArgumentError("no event category mapping for temporal parameter $name"))
+            length(event_change_points(cfg.event_calendar, category))
+        else
+            length(arr)
+        end
+        push!(specs, ParamSpec(name, :temporal, length_, lo, hi))
     end
     return specs
 end
@@ -2218,7 +2261,15 @@ function initial_vector(seed::Dict{String,Any}, specs::Vector{ParamSpec})
             val = optcfg === nothing ? float(current) : encode_scalar_value(optcfg, seed, spec, current)
             push!(values, val)
         else
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
+                points = event_change_points(optcfg.event_calendar, event_category_for_parameter(spec.name))
+                for bucket in spec.offset:(spec.offset + spec.length - 1)
+                    day = points[bucket].day
+                    source_idx = findlast(t -> Float64(t) <= day, interval_times)
+                    push!(values, source_idx === nothing ? (isempty(current) ? 0.5 : float(current[1])) : float(current[min(source_idx, length(current))]))
+                end
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 validate_interval_times(interval_times)
                 for month in spec.offset:(spec.offset + spec.length - 1)
@@ -2271,7 +2322,10 @@ function clip!(x::Vector{Float64}, specs::Vector{ParamSpec})
 end
 
 function temporal_active_length(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
-    if cfg.temporal_parameterization == "monthly"
+    if cfg.temporal_parameterization == "events"
+        points = event_change_points(cfg.event_calendar, event_category_for_parameter(spec.name))
+        return count(p -> p.day <= active_months * cfg.monthly_days, points)
+    elseif cfg.temporal_parameterization == "monthly"
         return min(active_months, spec.length)
     end
     active_days = active_months * cfg.monthly_days
@@ -2289,7 +2343,11 @@ end
 
 function temporal_bucket_day_ranges(seed::Dict{String,Any}, spec::ParamSpec, active_months::Int, cfg::OptimizerConfig)
     active_days = active_months * cfg.monthly_days
-    if cfg.temporal_parameterization == "monthly"
+    if cfg.temporal_parameterization == "events"
+        points = event_change_points(cfg.event_calendar, event_category_for_parameter(spec.name))
+        active = [p.day for p in points if p.day <= active_days]
+        return [(day, (i == length(active) ? active_days : active[i+1]-1)) for (i,day) in enumerate(active)]
+    elseif cfg.temporal_parameterization == "monthly"
         return [
             ((month - 1) * cfg.monthly_days + 1, min(month * cfg.monthly_days, active_days))
             for month in 1:min(spec.length, active_months)
@@ -2330,7 +2388,19 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             else
                 min(spec.length, temporal_active_length(seed, spec, active_months, optcfg))
             end
-            if optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
+            if optcfg !== nothing && optcfg.temporal_parameterization == "events"
+                interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
+                points = event_change_points(optcfg.event_calendar, event_category_for_parameter(spec.name))
+                active == 0 && (idx += spec.length; continue)
+                for i in eachindex(current)
+                    day = Int(ceil(Float64(interval_times[min(i, length(interval_times))])))
+                    bucket = findlast(p -> p.day <= day, points)
+                    bucket === nothing && continue
+                    (bucket < spec.offset || bucket >= spec.offset + active) && continue
+                    current[i] = x[idx + bucket - spec.offset]
+                end
+                idx += spec.length
+            elseif optcfg !== nothing && optcfg.temporal_parameterization == "monthly"
                 interval_times = get_nested(seed, replace(spec.name, "interval_values" => "interval_times"))
                 isempty(interval_times) || validate_interval_times(interval_times)
                 active == 0 && (idx += spec.length; continue)
@@ -2360,6 +2430,9 @@ function vector_to_config(seed::Dict{String,Any}, specs::Vector{ParamSpec}, x::V
             set_nested!(cfg, spec.name, current)
         end
     end
+    optcfg !== nothing && optcfg.temporal_parameterization == "events" &&
+        apply_event_seasonality!(cfg, optcfg.event_calendar, optcfg.event_seasonality,
+                                 active_months * monthly_days)
     return cfg
 end
 
@@ -4353,7 +4426,12 @@ function run_stage(
     specs_stage = stage_specs(seed, specs, cfg, stage)
     dim = sum(spec.length for spec in specs_stage)
     stage_root = joinpath(cfg.output_dir, "real_sims", stage.name)
+    calendar_metadata = cfg.event_calendar === nothing ? nothing : event_calendar_metadata(cfg.event_calendar; horizon_days=days)
+    calendar_metadata === nothing || (calendar_metadata["seasonality"] = deepcopy(cfg.event_seasonality))
     resume_state = load_stage_state(stage_root)
+    if resume_state !== nothing && cfg.event_calendar !== nothing
+        assert_event_calendar_resume!(resume_state, cfg.event_calendar; seasonality=cfg.event_seasonality)
+    end
     if resume_state !== nothing
         committed_check = validate_committed_artifacts(stage_root, "production-v1")
         committed_check["valid"] ||
@@ -4444,6 +4522,7 @@ function run_stage(
         "fit_months" => active_months,
         "monthly_days" => cfg.monthly_days,
         "simulation_days" => days,
+        "event_calendar" => calendar_metadata,
         "parameter_names" => coordinate_names(specs_stage),
         "population_size" => stage.population_size,
         "max_iterations" => stage.max_iterations,
@@ -5004,6 +5083,7 @@ function run_stage(
             "param_names" => coordinate_names(specs_stage),
             "search_policy" => policy.name,
             "fit_months" => active_months,
+            "event_calendar" => calendar_metadata,
             "best_score" => best_score,
             "sigma" => state.sigma,
             "configured_initial_sigma" => stage.sigma,
@@ -5047,6 +5127,7 @@ function run_stage(
         reusable_payload = full_reusable_state_from_cma(stage, specs_stage, state;
             transition_report=stage_transition_report)
         archive_ids = [archive_entry_id(entry) for entry in survivor_archive]
+        reusable_payload["event_calendar"] = calendar_metadata
         reusable_payload["historical_trajectory"] = trusted_trajectory
         reusable_payload["trajectory_identity"] = trusted_trajectory["identity"]
         reusable_payload["prefix_hash"] = trusted_prefix_hash

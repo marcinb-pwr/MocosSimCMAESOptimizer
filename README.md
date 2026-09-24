@@ -85,6 +85,12 @@ explains why the reported `0.371273` validation score coexists with severe
 full-horizon underprediction and proposes a scalar-profile, conditional-vector,
 then joint-refinement experiment instead of a global sigma increase.
 
+The follow-up [Phase 1 scalar audit](docs/saxony-corrected-phase1-scalars-v2-audit.md)
+visualizes all 96 candidates from the corrected scalar-only run, decomposes its
+composite objective, checks scalar boundary behavior and validation replicates,
+and provides a dependency-free script for regenerating the SVG figures and JSON
+summary from the published results repository.
+
 ## Two-phase corrected calibration
 
 Run the first two calibration phases as separate Slurm jobs. Phase 2 points to

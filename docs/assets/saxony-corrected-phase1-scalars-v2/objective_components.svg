@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480">
+<rect width="100%" height="100%" fill="white"/>
+<text x="480.0" y="28" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="bold">Iteration-winner objective components</text>
+<line x1="75" y1="415.0" x2="935" y2="415.0" stroke="#e5e7eb"/>
+<text x="65" y="419.0" text-anchor="end" font-family="sans-serif" font-size="12">0.000</text>
+<line x1="75" y1="343.0" x2="935" y2="343.0" stroke="#e5e7eb"/>
+<text x="65" y="347.0" text-anchor="end" font-family="sans-serif" font-size="12">0.141</text>
+<line x1="75" y1="271.0" x2="935" y2="271.0" stroke="#e5e7eb"/>
+<text x="65" y="275.0" text-anchor="end" font-family="sans-serif" font-size="12">0.281</text>
+<line x1="75" y1="199.0" x2="935" y2="199.0" stroke="#e5e7eb"/>
+<text x="65" y="203.0" text-anchor="end" font-family="sans-serif" font-size="12">0.422</text>
+<line x1="75" y1="127.0" x2="935" y2="127.0" stroke="#e5e7eb"/>
+<text x="65" y="131.0" text-anchor="end" font-family="sans-serif" font-size="12">0.563</text>
+<line x1="75" y1="55.0" x2="935" y2="55.0" stroke="#e5e7eb"/>
+<text x="65" y="59.0" text-anchor="end" font-family="sans-serif" font-size="12">0.703</text>
+<line x1="75" y1="415" x2="935" y2="415" stroke="#111827"/>
+<line x1="75" y1="55" x2="75" y2="415" stroke="#111827"/>
+<path d="M 75.0 182.9 L 197.9 249.7 L 320.7 249.7 L 443.6 249.7 L 566.4 204.4 L 689.3 305.9 L 812.1 305.9 L 935.0 288.2" fill="none" stroke="#2563eb" stroke-width="2"/>
+<circle cx="75.0" cy="182.9" r="3" fill="#2563eb"/>
+<circle cx="197.9" cy="249.7" r="3" fill="#2563eb"/>
+<circle cx="320.7" cy="249.7" r="3" fill="#2563eb"/>
+<circle cx="443.6" cy="249.7" r="3" fill="#2563eb"/>
+<circle cx="566.4" cy="204.4" r="3" fill="#2563eb"/>
+<circle cx="689.3" cy="305.9" r="3" fill="#2563eb"/>
+<circle cx="812.1" cy="305.9" r="3" fill="#2563eb"/>
+<circle cx="935.0" cy="288.2" r="3" fill="#2563eb"/>
+<path d="M 75.0 98.1 L 197.9 129.8 L 320.7 129.8 L 443.6 129.8 L 566.4 116.9 L 689.3 153.0 L 812.1 153.0 L 935.0 159.8" fill="none" stroke="#dc2626" stroke-width="2"/>
+<circle cx="75.0" cy="98.1" r="3" fill="#dc2626"/>
+<circle cx="197.9" cy="129.8" r="3" fill="#dc2626"/>
+<circle cx="320.7" cy="129.8" r="3" fill="#dc2626"/>
+<circle cx="443.6" cy="129.8" r="3" fill="#dc2626"/>
+<circle cx="566.4" cy="116.9" r="3" fill="#dc2626"/>
+<circle cx="689.3" cy="153.0" r="3" fill="#dc2626"/>
+<circle cx="812.1" cy="153.0" r="3" fill="#dc2626"/>
+<circle cx="935.0" cy="159.8" r="3" fill="#dc2626"/>
+<path d="M 75.0 196.1 L 197.9 130.9 L 320.7 130.9 L 443.6 130.9 L 566.4 182.0 L 689.3 81.7 L 812.1 81.7 L 935.0 104.6" fill="none" stroke="#059669" stroke-width="2"/>
+<circle cx="75.0" cy="196.1" r="3" fill="#059669"/>
+<circle cx="197.9" cy="130.9" r="3" fill="#059669"/>
+<circle cx="320.7" cy="130.9" r="3" fill="#059669"/>
+<circle cx="443.6" cy="130.9" r="3" fill="#059669"/>
+<circle cx="566.4" cy="182.0" r="3" fill="#059669"/>
+<circle cx="689.3" cy="81.7" r="3" fill="#059669"/>
+<circle cx="812.1" cy="81.7" r="3" fill="#059669"/>
+<circle cx="935.0" cy="104.6" r="3" fill="#059669"/>
+<text x="75.0" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">1</text>
+<text x="197.9" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">2</text>
+<text x="320.7" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">3</text>
+<text x="443.6" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">4</text>
+<text x="566.4" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">5</text>
+<text x="689.3" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">6</text>
+<text x="812.1" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">7</text>
+<text x="935.0" y="437" text-anchor="middle" font-family="sans-serif" font-size="12">8</text>
+<text x="480.0" y="466" text-anchor="middle" font-family="sans-serif" font-size="13">Iteration</text>
+<text x="18" y="240.0" text-anchor="middle" transform="rotate(-90 18 240.0)" font-family="sans-serif" font-size="13">Relative error</text>
+<rect x="75" y="38" width="12" height="12" fill="#2563eb"/>
+<text x="92" y="49" font-family="sans-serif" font-size="12">daily detections cumulative</text>
+<rect x="280" y="38" width="12" height="12" fill="#dc2626"/>
+<text x="297" y="49" font-family="sans-serif" font-size="12">daily deaths cumulative</text>
+<rect x="485" y="38" width="12" height="12" fill="#059669"/>
+<text x="502" y="49" font-family="sans-serif" font-size="12">validation mean error</text>
+</svg>
